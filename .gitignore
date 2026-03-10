@@ -1,0 +1,38 @@
+# ─── CRITICAL: Never commit these ────────────────────────
+.env
+.env.local
+.env.*.local
+*.env
+
+# ─── Dependencies ─────────────────────────────────────────
+node_modules/
+**/node_modules/
+
+# ─── Build outputs ────────────────────────────────────────
+dist/
+build/
+.vite/
+
+# ─── Evidence audio (sensitive) ───────────────────────────
+backend/evidence_files/
+*.webm
+*.mp3
+*.ogg
+*.wav
+
+# ─── Google Cloud credentials ─────────────────────────────
+service-account-key.json
+gcp-credentials.json
+
+# ─── Logs ─────────────────────────────────────────────────
+logs/
+*.log
+npm-debug.log*
+
+# ─── OS files ─────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+
+# ─── IDE ──────────────────────────────────────────────────
+.vscode/
+.idea/
