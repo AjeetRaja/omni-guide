@@ -1,215 +1,260 @@
-// server.js
-// Omni-Guide AI Assistant — Main Backend Server
+// ─────────────────────────────────────────────────────────────────────────────
+// backend/server.js  —  Omni-Guide Backend
+// Fixes: rate-limit cooldown, gemini-2.0-flash-lite, proper error handling
+// ─────────────────────────────────────────────────────────────────────────────
 
 require("dotenv").config();
-const express = require("express");
-const http = require("http");
+
+const express    = require("express");
+const http       = require("http");
 const { Server } = require("socket.io");
-const cors = require("cors");
-const multer = require("multer");
-const path = require("path");
+const cors       = require("cors");
+const path       = require("path");
 
-const { analyzeFrame, analyzeVocalThreat } = require("./services/geminiService");
+// ── Internal services ────────────────────────────────────────────────────────
+const { analyzeFrame }   = require("./services/geminiService");
 const { triggerFullSOS } = require("./services/twilioService");
-const { saveEvidenceAudio, serveLocalEvidence } = require("./services/evidenceService");
+const { uploadEvidence } = require("./services/evidenceService");
 
-// ─── App Setup ─────────────────────────────────────────────────────────────
-const app = express();
+// ─────────────────────────────────────────────────────────────────────────────
+// EXPRESS + HTTP + SOCKET.IO SETUP
+// ─────────────────────────────────────────────────────────────────────────────
+const app    = express();
 const server = http.createServer(app);
 
-const allowedOrigins = [
-  process.env.FRONTEND_URL || "http://localhost:5173",
-  "http://localhost:3000",
-  "http://localhost:5173",
-];
-
 const io = new Server(server, {
-  cors: { origin: allowedOrigins, methods: ["GET", "POST"] },
-  // Increase ping timeout to prevent premature disconnections
-  pingTimeout: 60000,
-  pingInterval: 25000,
+  cors: {
+    origin: [
+      process.env.FRONTEND_URL || "http://localhost:5173",
+      "http://localhost:3000",
+      "http://127.0.0.1:5173",
+    ],
+    methods: ["GET", "POST"],
+  },
+  maxHttpBufferSize: 5 * 1024 * 1024, // 5MB — enough for a JPEG frame
 });
 
-app.use(cors({ origin: allowedOrigins }));
+// ─────────────────────────────────────────────────────────────────────────────
+// MIDDLEWARE
+// ─────────────────────────────────────────────────────────────────────────────
+app.use(cors({
+  origin: [
+    process.env.FRONTEND_URL || "http://localhost:5173",
+    "http://localhost:3000",
+    "http://127.0.0.1:5173",
+  ],
+}));
 app.use(express.json({ limit: "10mb" }));
 app.use(express.urlencoded({ extended: true, limit: "10mb" }));
-serveLocalEvidence(app);
 
-// Multer for evidence audio uploads
-const upload = multer({
-  storage: multer.memoryStorage(),
-  limits: { fileSize: 50 * 1024 * 1024 }, // 50MB max
-});
+// ─────────────────────────────────────────────────────────────────────────────
+// RATE LIMITING — prevents quota burn on free tier
+// ─────────────────────────────────────────────────────────────────────────────
+const lastCallTime  = new Map(); // socketId → timestamp
+const pendingCall   = new Map(); // socketId → boolean (is a call in-flight?)
+const COOLDOWN_MS   = 3000;      // 3 seconds between Gemini calls per socket
 
-// ─── Per-Socket Rate Limiting ──────────────────────────────────────────────
-// Prevents flooding: tracks last processed time per socket
-const socketLastProcessed = new Map();
-const MIN_FRAME_INTERVAL_MS = 500; // Max 2 frames/sec per socket
+function isRateLimited(socketId) {
+  const now  = Date.now();
+  const last = lastCallTime.get(socketId) || 0;
+  return now - last < COOLDOWN_MS;
+}
 
-// ─── Health Check ──────────────────────────────────────────────────────────
+function markCalled(socketId) {
+  lastCallTime.set(socketId, Date.now());
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// REST HEALTH CHECK
+// ─────────────────────────────────────────────────────────────────────────────
 app.get("/health", (req, res) => {
   res.json({
-    status: "ok",
-    service: "omni-guide-backend",
+    status:    "ok",
     timestamp: new Date().toISOString(),
-    gemini: !!process.env.GEMINI_API_KEY,
-    twilio: !!(process.env.TWILIO_ACCOUNT_SID && process.env.TWILIO_AUTH_TOKEN),
+    gemini:    !!process.env.GEMINI_API_KEY,
+    twilio:    !!process.env.TWILIO_ACCOUNT_SID,
   });
 });
 
-// ─── REST: SOS Trigger ────────────────────────────────────────────────────
-app.post("/api/sos", async (req, res) => {
-  const { userName, location, evidenceUrl, threatType } = req.body;
+// ─────────────────────────────────────────────────────────────────────────────
+// REST: Vocal threat analysis (called from frontend)
+// ─────────────────────────────────────────────────────────────────────────────
+app.post("/api/analyze/vocal", (req, res) => {
+  const { transcript = "" } = req.body;
+  if (!transcript.trim()) return res.json({ isThreat: false });
 
-  if (!userName) {
-    return res.status(400).json({ error: "userName is required" });
-  }
+  const THREAT_WORDS = [
+    "knife", "gun", "weapon", "attack", "kill", "hurt",
+    "fight", "stab", "shoot", "robbery", "help me", "leave me alone",
+  ];
 
-  try {
-    const result = await triggerFullSOS({ userName, location, evidenceUrl, threatType });
-    res.json(result);
-  } catch (err) {
-    console.error("[SOS Route] Error:", err.message);
-    res.status(500).json({ error: err.message });
-  }
+  const lower    = transcript.toLowerCase();
+  const matched  = THREAT_WORDS.filter((w) => lower.includes(w));
+  const isThreat = matched.length > 0;
+
+  res.json({
+    isThreat,
+    threatType: isThreat ? matched.join(", ") : null,
+    severity:   isThreat ? (matched.length > 1 ? "high" : "medium") : "none",
+  });
 });
 
-// ─── REST: Upload Evidence Audio ──────────────────────────────────────────
-app.post("/api/evidence/upload", upload.single("audio"), async (req, res) => {
-  if (!req.file) {
-    return res.status(400).json({ error: "No audio file provided" });
-  }
-
-  const { userId } = req.body;
-
-  try {
-    const result = await saveEvidenceAudio(req.file.buffer, userId || "anonymous");
-    res.json({ success: true, ...result });
-  } catch (err) {
-    console.error("[Evidence Upload] Error:", err.message);
-    res.status(500).json({ error: err.message });
-  }
-});
-
-// ─── REST: Vocal Threat Detection ─────────────────────────────────────────
-app.post("/api/analyze/vocal", async (req, res) => {
-  const { transcript } = req.body;
-  if (!transcript) {
-    return res.status(400).json({ error: "transcript is required" });
-  }
-
-  try {
-    const result = await analyzeVocalThreat(transcript);
-    res.json(result);
-  } catch (err) {
-    console.error("[Vocal Analysis] Error:", err.message);
-    res.status(500).json({ error: err.message });
-  }
-});
-
-// ─── Socket.IO: Real-time Frame Processing ────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
+// SOCKET.IO — Main real-time logic
+// ─────────────────────────────────────────────────────────────────────────────
 io.on("connection", (socket) => {
   console.log(`[Socket] Client connected: ${socket.id}`);
-  socketLastProcessed.set(socket.id, 0);
 
-  // ── Frame Analysis Event ──────────────────────────────────────────────
-  // FIX: Use async handler with proper error boundaries to prevent "Thinking..." hang
-  socket.on("analyze_frame", async (payload) => {
-    const { imageBase64, mode, userQuery } = payload || {};
+  // ── ANALYZE FRAME ──────────────────────────────────────────────────────────
+  socket.on("analyze_frame", async (data) => {
+    const { imageBase64, mode = "navigate", userQuery = "" } = data || {};
 
-    // Input validation
+    // Guard: no image
     if (!imageBase64) {
-      return socket.emit("analysis_error", { error: "No image data provided" });
+      socket.emit("analysis_error", { message: "No image received." });
+      return;
     }
 
-    // Rate limiting: drop frames if too frequent
-    const now = Date.now();
-    const lastTime = socketLastProcessed.get(socket.id) || 0;
-    if (now - lastTime < MIN_FRAME_INTERVAL_MS) {
-      return; // Silently drop — prevents queue buildup
+    // Guard: already processing
+    if (pendingCall.get(socket.id)) {
+      // Silently drop — frontend handles UI state
+      return;
     }
-    socketLastProcessed.set(socket.id, now);
 
-    // Signal to client that processing has started
-    socket.emit("analysis_start");
+    // Guard: rate limit
+    if (isRateLimited(socket.id)) {
+      const waitSec = Math.ceil(
+        (COOLDOWN_MS - (Date.now() - (lastCallTime.get(socket.id) || 0))) / 1000
+      );
+      socket.emit("analysis_result", {
+        text: `Ready in ${waitSec} second${waitSec !== 1 ? "s" : ""}.`,
+      });
+      return;
+    }
+
+    // Mark in-flight
+    pendingCall.set(socket.id, true);
+    markCalled(socket.id);
+
+    // Emit start so frontend shows "Thinking..."
+    socket.emit("analysis_start", { mode });
+
+    const startTime = Date.now();
 
     try {
-      // Strip data URL prefix if present
-      const cleanBase64 = imageBase64.replace(/^data:image\/\w+;base64,/, "");
-
-      const startTime = Date.now();
-      const { text, raw } = await analyzeFrame(cleanBase64, mode || "navigation", userQuery || "");
+      const result = await analyzeFrame({ imageBase64, mode, userQuery });
       const latency = Date.now() - startTime;
 
-      console.log(`[Gemini] ${mode} | ${latency}ms | ${text?.substring(0, 60)}`);
+      console.log(`[Gemini] ${mode} | ${latency}ms | ${result?.text?.slice(0, 80) || "no text"}`);
 
-      // Emit result back to the specific client
       socket.emit("analysis_result", {
-        text,
-        raw,
-        mode,
+        text:    result.text,
+        raw:     result.raw || null,
         latency,
-        timestamp: Date.now(),
+        mode,
       });
+    } catch (err) {
+      const latency = Date.now() - startTime;
+      console.error("[Gemini Service Error]:", err.message);
 
-      // If danger mode detects critical threat, also broadcast to trigger SOS flow
-      if (mode === "danger" && raw?.threat_detected && raw?.requires_sos) {
-        socket.emit("threat_detected", {
-          threatType: raw.threat_type,
-          threatLevel: raw.threat_level,
-          message: raw.alert_message,
-        });
+      // User-friendly error messages
+      let friendlyMsg = "I couldn't analyse that. Please try again.";
+
+      if (err.message?.includes("429") || err.message?.includes("quota")) {
+        friendlyMsg = "Too many requests. Please wait a few seconds.";
+      } else if (err.message?.includes("404")) {
+        friendlyMsg = "AI model unavailable. Check server configuration.";
+      } else if (err.message?.includes("403")) {
+        friendlyMsg = "API key invalid. Check your GEMINI_API_KEY.";
       }
-    } catch (err) {
-      console.error(`[Socket] Frame analysis error for ${socket.id}:`, err.message);
-      // Emit error instead of hanging — this is the "Thinking..." fix
-      socket.emit("analysis_error", {
-        error: "Analysis failed. Please try again.",
-        detail: err.message,
-      });
+
+      socket.emit("analysis_result", { text: friendlyMsg, latency, mode });
+    } finally {
+      pendingCall.delete(socket.id);
     }
   });
 
-  // ── SOS Trigger via Socket ────────────────────────────────────────────
-  socket.on("trigger_sos", async (payload) => {
-    const { userName, location, evidenceUrl, threatType } = payload || {};
+  // ── SOS TRIGGER ────────────────────────────────────────────────────────────
+  socket.on("sos_trigger", async (data) => {
+    const { timestamp, gpsLat, gpsLng, audioChunks } = data || {};
 
-    console.log(`[Socket] SOS triggered by ${socket.id} for user: ${userName}`);
-    socket.emit("sos_status", { status: "initiating", message: "Contacting emergency services..." });
+    console.log(`[SOS] Triggered by ${socket.id} at ${new Date(timestamp).toISOString()}`);
 
+    socket.emit("sos_acknowledged", { status: "processing" });
+
+    let evidenceUrl = null;
+
+    // Step 1: Upload audio evidence if provided
+    if (audioChunks?.length) {
+      try {
+        evidenceUrl = await uploadEvidence(audioChunks, socket.id);
+        console.log(`[SOS] Evidence uploaded: ${evidenceUrl}`);
+      } catch (err) {
+        console.error("[SOS] Evidence upload failed:", err.message);
+      }
+    }
+
+    // Step 2: Fire Twilio (SMS + voice call)
     try {
-      const result = await triggerFullSOS({ userName, location, evidenceUrl, threatType });
-      socket.emit("sos_status", {
-        status: result.success ? "sent" : "partial_failure",
-        message: result.success ? "SOS sent to police and guardian." : "Some SOS messages failed.",
-        results: result.results,
+      await triggerFullSOS({
+        gpsLat:      gpsLat || "unknown",
+        gpsLng:      gpsLng || "unknown",
+        evidenceUrl: evidenceUrl || "No audio evidence",
+        timestamp:   timestamp || Date.now(),
       });
+      console.log(`[SOS] Twilio alerts sent successfully.`);
+      socket.emit("sos_acknowledged", { status: "sent" });
     } catch (err) {
-      console.error(`[Socket] SOS error for ${socket.id}:`, err.message);
-      socket.emit("sos_status", { status: "error", message: "SOS failed. Call 100 manually." });
+      console.error("[SOS] Twilio failed:", err.message);
+      // SOS UI should still show even if Twilio fails
+      socket.emit("sos_acknowledged", { status: "partial", error: err.message });
     }
   });
 
-  // ── Cleanup on disconnect ──────────────────────────────────────────────
+  // ── DISCONNECT ─────────────────────────────────────────────────────────────
   socket.on("disconnect", (reason) => {
-    console.log(`[Socket] Disconnected: ${socket.id} (${reason})`);
-    socketLastProcessed.delete(socket.id);
+    console.log(`[Socket] Client disconnected: ${socket.id} (${reason})`);
+    lastCallTime.delete(socket.id);
+    pendingCall.delete(socket.id);
+  });
+
+  // ── ERROR ──────────────────────────────────────────────────────────────────
+  socket.on("error", (err) => {
+    console.error(`[Socket] Error from ${socket.id}:`, err.message);
   });
 });
 
-// ─── Start Server ──────────────────────────────────────────────────────────
-const PORT = process.env.PORT || 3001;
-server.listen(PORT, () => {
-  console.log(`
-╔══════════════════════════════════════════════╗
-║        OMNI-GUIDE BACKEND  v1.0.0            ║
-║   The Digital Eye — Serving on port ${PORT}    ║
-╠══════════════════════════════════════════════╣
-║  Gemini: ${process.env.GEMINI_API_KEY ? "✓ Configured" : "✗ Missing API Key"}                   ║
-║  Twilio: ${process.env.TWILIO_ACCOUNT_SID ? "✓ Configured" : "✗ Missing Credentials"}                ║
-║  GCS:    ${process.env.GOOGLE_CLOUD_BUCKET_NAME ? "✓ Configured" : "✗ Using local fallback"}              ║
-╚══════════════════════════════════════════════╝
-  `);
+// ─────────────────────────────────────────────────────────────────────────────
+// GRACEFUL SHUTDOWN
+// ─────────────────────────────────────────────────────────────────────────────
+process.on("SIGTERM", () => {
+  console.log("[Server] SIGTERM received — shutting down gracefully.");
+  server.close(() => {
+    console.log("[Server] HTTP server closed.");
+    process.exit(0);
+  });
 });
 
-module.exports = { app, server }; // For testing
+process.on("uncaughtException", (err) => {
+  console.error("[Server] Uncaught Exception:", err.message);
+});
+
+process.on("unhandledRejection", (reason) => {
+  console.error("[Server] Unhandled Rejection:", reason);
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// START
+// ─────────────────────────────────────────────────────────────────────────────
+const PORT = process.env.PORT || 3001;
+
+server.listen(PORT, () => {
+  console.log("─────────────────────────────────────────");
+  console.log(`  🟢  Omni-Guide Backend running`);
+  console.log(`  📡  Port     : ${PORT}`);
+  console.log(`  🤖  Gemini   : ${process.env.GEMINI_API_KEY ? "✅ Key loaded" : "❌ MISSING KEY"}`);
+  console.log(`  📞  Twilio   : ${process.env.TWILIO_ACCOUNT_SID ? "✅ Configured" : "⚠️  Not configured"}`);
+  console.log(`  🌐  Frontend : ${process.env.FRONTEND_URL || "http://localhost:5173"}`);
+  console.log(`  ⏱️  Cooldown : ${COOLDOWN_MS}ms per socket`);
+  console.log("─────────────────────────────────────────");
+});
